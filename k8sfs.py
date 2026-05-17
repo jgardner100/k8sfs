@@ -18,6 +18,7 @@ import stat
 import time
 from datetime import datetime, timezone
 
+import yaml
 from fuse import FUSE, Operations, FuseOSError
 from kubernetes import client, config
 from kubernetes.config.config_exception import ConfigException
@@ -32,6 +33,7 @@ class K8sNamespaceFS(Operations):
 
         self.core_v1 = client.CoreV1Api()
         self.apps_v1 = client.AppsV1Api()
+        self.api_client = client.ApiClient()
 
         self.cache_ttl_seconds = 5
 
@@ -79,6 +81,9 @@ class K8sNamespaceFS(Operations):
 
         if deployment not in self._deployments(namespace):
             raise FuseOSError(errno.ENOENT)
+
+        if pod_name == "deployment.yaml":
+            raise FuseOSError(errno.EPERM)
 
         pod = self._pod_for_deployment(namespace, deployment, pod_name)
 
@@ -426,6 +431,22 @@ class K8sNamespaceFS(Operations):
             f"Node: {self._pod_node(pod)}\n"
         )
 
+    def _deployment_yaml_content(self, namespace, deployment):
+        deployment_obj = self._deployment(namespace, deployment)
+
+        if not deployment_obj:
+            return None
+
+        deployment_dict = self.api_client.sanitize_for_serialization(
+            deployment_obj
+        )
+
+        return yaml.safe_dump(
+            deployment_dict,
+            default_flow_style=False,
+            sort_keys=False,
+        )
+
     def getattr(self, path, fh=None):
         # /
         if path == "/":
@@ -470,9 +491,9 @@ class K8sNamespaceFS(Operations):
 
             raise FuseOSError(errno.ENOENT)
 
-        # /namespace/deployment/pod
+        # /namespace/deployment/deployment.yaml or /namespace/deployment/pod
         if len(parts) == 3:
-            namespace, deployment, pod_name = parts
+            namespace, deployment, name = parts
 
             if namespace not in self._namespaces():
                 raise FuseOSError(errno.ENOENT)
@@ -480,7 +501,15 @@ class K8sNamespaceFS(Operations):
             if deployment not in self._deployments(namespace):
                 raise FuseOSError(errno.ENOENT)
 
-            pod = self._pod_for_deployment(namespace, deployment, pod_name)
+            if name == "deployment.yaml":
+                content = self._deployment_yaml_content(namespace, deployment)
+
+                if content is None:
+                    raise FuseOSError(errno.ENOENT)
+
+                return self._file_attrs(content)
+
+            pod = self._pod_for_deployment(namespace, deployment, name)
 
             if pod:
                 return self._file_attrs(self._pod_file_content(pod))
@@ -541,6 +570,7 @@ class K8sNamespaceFS(Operations):
 
             yield "."
             yield ".."
+            yield "deployment.yaml"
 
             for pod in self._pods_for_deployment(namespace, deployment):
                 yield pod
@@ -574,8 +604,21 @@ class K8sNamespaceFS(Operations):
         if len(parts) != 3:
             raise FuseOSError(errno.EISDIR)
 
-        namespace, deployment, pod_name = parts
-        pod = self._pod_for_deployment(namespace, deployment, pod_name)
+        namespace, deployment, name = parts
+
+        if namespace not in self._namespaces():
+            raise FuseOSError(errno.ENOENT)
+
+        if deployment not in self._deployments(namespace):
+            raise FuseOSError(errno.ENOENT)
+
+        if name == "deployment.yaml":
+            if self._deployment_yaml_content(namespace, deployment) is None:
+                raise FuseOSError(errno.ENOENT)
+
+            return 0
+
+        pod = self._pod_for_deployment(namespace, deployment, name)
 
         if not pod:
             raise FuseOSError(errno.ENOENT)
@@ -588,8 +631,24 @@ class K8sNamespaceFS(Operations):
         if len(parts) != 3:
             raise FuseOSError(errno.EISDIR)
 
-        namespace, deployment, pod_name = parts
-        pod = self._pod_for_deployment(namespace, deployment, pod_name)
+        namespace, deployment, name = parts
+
+        if namespace not in self._namespaces():
+            raise FuseOSError(errno.ENOENT)
+
+        if deployment not in self._deployments(namespace):
+            raise FuseOSError(errno.ENOENT)
+
+        if name == "deployment.yaml":
+            content = self._deployment_yaml_content(namespace, deployment)
+
+            if content is None:
+                raise FuseOSError(errno.ENOENT)
+
+            data = content.encode("utf-8")
+            return data[offset:offset + size]
+
+        pod = self._pod_for_deployment(namespace, deployment, name)
 
         if not pod:
             raise FuseOSError(errno.ENOENT)
