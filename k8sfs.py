@@ -1,675 +1,439 @@
 #!/usr/bin/env python3
-
-import os
-
-# Needed on macOS when fusepy cannot auto-detect macFUSE.
-for lib in (
-    "/usr/local/lib/libfuse.2.dylib",
-    "/usr/local/lib/libfuse.dylib",
-    "/opt/homebrew/lib/libfuse.2.dylib",
-    "/opt/homebrew/lib/libfuse.dylib",
-):
-    if os.path.exists(lib):
-        os.environ.setdefault("FUSE_LIBRARY_PATH", lib)
-        break
-
 import errno
+import os
 import stat
 import time
 from datetime import datetime, timezone
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import yaml
-from fuse import FUSE, Operations, FuseOSError
+from fuse import FUSE, FuseOSError, LoggingMixIn, Operations
 from kubernetes import client, config
-from kubernetes.config.config_exception import ConfigException
+from kubernetes.client.rest import ApiException
 
 
-class K8sNamespaceFS(Operations):
-    def __init__(self):
+FILE_MODE = stat.S_IFREG | 0o444
+DIR_MODE = stat.S_IFDIR | 0o555
+SYMLINK_MODE = stat.S_IFLNK | 0o777
+
+
+class K8sFS(LoggingMixIn, Operations):
+    """
+    Exposes Kubernetes namespaces, deployments, pods, services, and nodes as a
+    read-only filesystem, except that deleting a pod status file deletes the pod.
+
+    Layout:
+
+      /
+        <namespace>/
+          services/
+            <service>/
+              status
+              deployment.yaml
+          <deployment>/
+            deployment.yaml
+            <pod>
+        <node>/
+          <pod> -> /<namespace>/<deployment>/<pod>
+    """
+
+    def __init__(self) -> None:
         try:
             config.load_kube_config()
-        except ConfigException:
+        except Exception:
             config.load_incluster_config()
 
-        self.core_v1 = client.CoreV1Api()
-        self.apps_v1 = client.AppsV1Api()
+        self.core = client.CoreV1Api()
+        self.apps = client.AppsV1Api()
         self.api_client = client.ApiClient()
 
-        self.cache_ttl_seconds = 5
+    # ---------------------------------------------------------------------
+    # Kubernetes helpers
+    # ---------------------------------------------------------------------
 
-        self._namespace_cache = []
-        self._namespace_cache_time = 0
+    def _serialise_yaml(self, obj) -> str:
+        data = self.api_client.sanitize_for_serialization(obj)
+        return yaml.safe_dump(data, sort_keys=False)
 
-        self._deployment_cache = {}
-        self._deployment_cache_time = {}
+    def _age(self, created_at: Optional[datetime]) -> str:
+        if not created_at:
+            return "<unknown>"
 
-        # Key: (namespace, deployment)
-        # Value: {pod_name: pod_object}
-        self._pod_cache = {}
-        self._pod_cache_time = {}
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
 
-        self._node_cache = []
-        self._node_cache_time = 0
+        seconds = max(0, int((datetime.now(timezone.utc) - created_at).total_seconds()))
+        minutes = seconds // 60
+        hours = minutes // 60
+        days = hours // 24
 
-        # Key: node_name
-        # Value: {link_name: target_path}
-        self._node_pod_links_cache = {}
-        self._node_pod_links_cache_time = {}
+        if days:
+            return f"{days}d"
+        if hours:
+            return f"{hours}h"
+        if minutes:
+            return f"{minutes}m"
+        return f"{seconds}s"
 
-        # Key: (namespace, replicaset_name)
-        # Value: deployment_name or None
-        self._replicaset_deployment_cache = {}
-        self._replicaset_deployment_cache_time = {}
+    def _namespaces(self) -> List[str]:
+        return sorted(ns.metadata.name for ns in self.core.list_namespace().items)
 
-    def unlink(self, path):
-        parts = path.strip("/").split("/")
+    def _nodes(self) -> List[str]:
+        return sorted(node.metadata.name for node in self.core.list_node().items)
 
-        # Node pod entries are virtual symlinks. Do not allow deleting the
-        # symlink path, because it does not represent the real pod file.
-        if len(parts) == 2 and parts[0] in self._nodes():
-            raise FuseOSError(errno.EPERM)
+    def _deployments(self, namespace: str) -> List[str]:
+        return sorted(
+            deploy.metadata.name
+            for deploy in self.apps.list_namespaced_deployment(namespace).items
+        )
 
-        # Only real pod files can be deleted:
-        # /namespace/deployment/pod
-        if len(parts) != 3:
-            raise FuseOSError(errno.EISDIR)
+    def _services(self, namespace: str) -> List[str]:
+        return sorted(
+            service.metadata.name
+            for service in self.core.list_namespaced_service(namespace).items
+        )
 
-        namespace, deployment, pod_name = parts
+    def _read_deployment(self, namespace: str, deployment: str):
+        return self.apps.read_namespaced_deployment(deployment, namespace)
 
-        if namespace not in self._namespaces():
-            raise FuseOSError(errno.ENOENT)
+    def _read_service(self, namespace: str, service: str):
+        return self.core.read_namespaced_service(service, namespace)
 
-        if deployment not in self._deployments(namespace):
-            raise FuseOSError(errno.ENOENT)
+    def _deployment_selector(self, namespace: str, deployment: str) -> str:
+        deploy = self._read_deployment(namespace, deployment)
+        labels = {}
 
-        if pod_name == "deployment.yaml":
-            raise FuseOSError(errno.EPERM)
+        selector = deploy.spec.selector if deploy.spec else None
+        if selector and selector.match_labels:
+            labels.update(selector.match_labels)
 
-        pod = self._pod_for_deployment(namespace, deployment, pod_name)
+        return ",".join(f"{key}={value}" for key, value in sorted(labels.items()))
 
-        if not pod:
-            raise FuseOSError(errno.ENOENT)
+    def _pods_for_deployment(self, namespace: str, deployment: str):
+        selector = self._deployment_selector(namespace, deployment)
+        if not selector:
+            return []
 
-        try:
-            self.core_v1.delete_namespaced_pod(
-                name=pod_name,
-                namespace=namespace,
-                body=client.V1DeleteOptions(),
-            )
-        except client.exceptions.ApiException as e:
-            if e.status == 404:
-                raise FuseOSError(errno.ENOENT)
+        return sorted(
+            self.core.list_namespaced_pod(namespace, label_selector=selector).items,
+            key=lambda pod: pod.metadata.name,
+        )
 
-            if e.status == 403:
-                raise FuseOSError(errno.EACCES)
+    def _pod_names_for_deployment(self, namespace: str, deployment: str) -> List[str]:
+        return [pod.metadata.name for pod in self._pods_for_deployment(namespace, deployment)]
 
-            raise FuseOSError(errno.EIO)
+    def _read_pod(self, namespace: str, pod: str):
+        return self.core.read_namespaced_pod(pod, namespace)
 
-        # Invalidate pod cache so `ls` updates quickly.
-        cache_key = (namespace, deployment)
-        self._pod_cache.pop(cache_key, None)
-        self._pod_cache_time.pop(cache_key, None)
-
-        # Invalidate the node symlink cache for the node this pod was on.
-        node_name = pod.spec.node_name
-        if node_name:
-            self._node_pod_links_cache.pop(node_name, None)
-            self._node_pod_links_cache_time.pop(node_name, None)
-
-        return 0
-
-    def _dir_attrs(self):
-        now = int(time.time())
-
-        return {
-            "st_mode": stat.S_IFDIR | 0o755,
-            "st_nlink": 2,
-            "st_ctime": now,
-            "st_mtime": now,
-            "st_atime": now,
-        }
-
-    def _file_attrs(self, content):
-        now = int(time.time())
-        data = content.encode("utf-8")
-
-        return {
-            "st_mode": stat.S_IFREG | 0o444,
-            "st_nlink": 1,
-            "st_size": len(data),
-            "st_ctime": now,
-            "st_mtime": now,
-            "st_atime": now,
-        }
-
-    def _symlink_attrs(self, target):
-        now = int(time.time())
-        data = target.encode("utf-8")
-
-        return {
-            "st_mode": stat.S_IFLNK | 0o777,
-            "st_nlink": 1,
-            "st_size": len(data),
-            "st_ctime": now,
-            "st_mtime": now,
-            "st_atime": now,
-        }
-
-    def _namespaces(self):
-        now = time.time()
-
-        if now - self._namespace_cache_time > self.cache_ttl_seconds:
-            result = self.core_v1.list_namespace()
-            self._namespace_cache = sorted(
-                ns.metadata.name for ns in result.items
-            )
-            self._namespace_cache_time = now
-
-        return self._namespace_cache
-
-    def _nodes(self):
-        now = time.time()
-
-        if now - self._node_cache_time > self.cache_ttl_seconds:
-            result = self.core_v1.list_node()
-            self._node_cache = sorted(
-                node.metadata.name for node in result.items
-            )
-            self._node_cache_time = now
-
-        return self._node_cache
-
-    def _deployments(self, namespace):
-        now = time.time()
-        last_fetch = self._deployment_cache_time.get(namespace, 0)
-
-        if now - last_fetch > self.cache_ttl_seconds:
-            result = self.apps_v1.list_namespaced_deployment(namespace=namespace)
-            self._deployment_cache[namespace] = sorted(
-                deploy.metadata.name for deploy in result.items
-            )
-            self._deployment_cache_time[namespace] = now
-
-        return self._deployment_cache.get(namespace, [])
-
-    def _deployment(self, namespace, deployment):
-        try:
-            return self.apps_v1.read_namespaced_deployment(
-                name=deployment,
-                namespace=namespace,
-            )
-        except Exception:
-            return None
-
-    def _deployment_for_replicaset(self, namespace, replicaset_name):
-        now = time.time()
-        cache_key = (namespace, replicaset_name)
-        last_fetch = self._replicaset_deployment_cache_time.get(cache_key, 0)
-
-        if now - last_fetch > self.cache_ttl_seconds:
-            deployment_name = None
-
-            try:
-                replica_set = self.apps_v1.read_namespaced_replica_set(
-                    name=replicaset_name,
-                    namespace=namespace,
-                )
-
-                for owner in replica_set.metadata.owner_references or []:
-                    if owner.kind == "Deployment":
-                        deployment_name = owner.name
-                        break
-
-            except client.exceptions.ApiException:
-                deployment_name = None
-
-            self._replicaset_deployment_cache[cache_key] = deployment_name
-            self._replicaset_deployment_cache_time[cache_key] = now
-
-        return self._replicaset_deployment_cache.get(cache_key)
-
-    def _deployment_for_pod(self, pod):
-        namespace = pod.metadata.namespace
-
-        for owner in pod.metadata.owner_references or []:
-            if owner.kind == "Deployment":
-                return owner.name
-
-            if owner.kind == "ReplicaSet":
-                return self._deployment_for_replicaset(namespace, owner.name)
-
+    def _pod_path(self, namespace: str, pod_name: str) -> Optional[str]:
+        for deployment in self._deployments(namespace):
+            if pod_name in self._pod_names_for_deployment(namespace, deployment):
+                return f"/{namespace}/{deployment}/{pod_name}"
         return None
 
-    def _pod_links_for_node(self, node_name):
-        now = time.time()
-        last_fetch = self._node_pod_links_cache_time.get(node_name, 0)
+    def _pods_on_node(self, node_name: str) -> Dict[str, str]:
+        links: Dict[str, str] = {}
 
-        if now - last_fetch > self.cache_ttl_seconds:
-            result = self.core_v1.list_pod_for_all_namespaces(
+        for namespace in self._namespaces():
+            pods = self.core.list_namespaced_pod(
+                namespace,
                 field_selector=f"spec.nodeName={node_name}",
-            )
+            ).items
 
-            links = {}
-
-            for pod in result.items:
-                namespace = pod.metadata.namespace
-                pod_name = pod.metadata.name
-                deployment = self._deployment_for_pod(pod)
-
-                # Only Deployment-owned pods have a valid target path of:
-                # /namespace/deployment/pod
-                if not deployment:
+            for pod in pods:
+                pod_path = self._pod_path(namespace, pod.metadata.name)
+                if not pod_path:
                     continue
 
-                # Include namespace in the link name to avoid collisions between
-                # same-named pods in different namespaces on the same node.
-                link_name = f"{namespace}__{pod_name}"
-                target = f"../{namespace}/{deployment}/{pod_name}"
+                link_name = pod.metadata.name
 
-                links[link_name] = target
+                # Pod names are only namespace-unique. If there is a collision in
+                # this node directory, keep the normal name for the first pod and
+                # use a namespace-qualified link for subsequent collisions.
+                if link_name in links:
+                    link_name = f"{namespace}__{pod.metadata.name}"
 
-            self._node_pod_links_cache[node_name] = links
-            self._node_pod_links_cache_time[node_name] = now
+                links[link_name] = pod_path
 
-        return self._node_pod_links_cache.get(node_name, {})
+        return dict(sorted(links.items()))
 
-    def _label_selector_from_deployment(self, deployment_obj):
-        selector = deployment_obj.spec.selector
+    # ---------------------------------------------------------------------
+    # Rendered file content
+    # ---------------------------------------------------------------------
 
-        if not selector:
-            return ""
-
-        parts = []
-
-        if selector.match_labels:
-            for key, value in selector.match_labels.items():
-                parts.append(f"{key}={value}")
-
-        if selector.match_expressions:
-            for expr in selector.match_expressions:
-                key = expr.key
-                operator = expr.operator
-                values = expr.values or []
-
-                if operator == "In":
-                    parts.append(f"{key} in ({','.join(values)})")
-                elif operator == "NotIn":
-                    parts.append(f"{key} notin ({','.join(values)})")
-                elif operator == "Exists":
-                    parts.append(key)
-                elif operator == "DoesNotExist":
-                    parts.append(f"!{key}")
-
-        return ",".join(parts)
-
-    def _pod_map_for_deployment(self, namespace, deployment):
-        now = time.time()
-        cache_key = (namespace, deployment)
-        last_fetch = self._pod_cache_time.get(cache_key, 0)
-
-        if now - last_fetch > self.cache_ttl_seconds:
-            deployment_obj = self._deployment(namespace, deployment)
-
-            if not deployment_obj:
-                self._pod_cache[cache_key] = {}
-                self._pod_cache_time[cache_key] = now
-                return {}
-
-            label_selector = self._label_selector_from_deployment(deployment_obj)
-
-            if not label_selector:
-                self._pod_cache[cache_key] = {}
-                self._pod_cache_time[cache_key] = now
-                return {}
-
-            result = self.core_v1.list_namespaced_pod(
-                namespace=namespace,
-                label_selector=label_selector,
-            )
-
-            self._pod_cache[cache_key] = {
-                pod.metadata.name: pod
-                for pod in result.items
-            }
-            self._pod_cache_time[cache_key] = now
-
-        return self._pod_cache.get(cache_key, {})
-
-    def _pod_ip(self, pod):
-        return pod.status.pod_ip or "None"
-
-    def _pod_node(self, pod):
-        return pod.spec.node_name or "None"
-
-    def _pods_for_deployment(self, namespace, deployment):
-        return sorted(
-            self._pod_map_for_deployment(namespace, deployment).keys()
-        )
-
-    def _pod_for_deployment(self, namespace, deployment, pod_name):
-        return self._pod_map_for_deployment(namespace, deployment).get(pod_name)
-
-    def _pod_ready(self, pod):
+    def _pod_status_text(self, namespace: str, pod_name: str) -> str:
+        pod = self._read_pod(namespace, pod_name)
         statuses = pod.status.container_statuses or []
-        total = len(statuses)
-
-        if total == 0 and pod.spec and pod.spec.containers:
-            total = len(pod.spec.containers)
-
         ready = sum(1 for status in statuses if status.ready)
+        total = len(pod.spec.containers or [])
+        restarts = sum(status.restart_count or 0 for status in statuses)
 
-        return f"{ready}/{total}"
-
-    def _pod_restarts(self, pod):
-        statuses = pod.status.container_statuses or []
-        return sum(status.restart_count or 0 for status in statuses)
-
-    def _pod_status(self, pod):
-        if pod.metadata.deletion_timestamp:
-            return "Terminating"
-
-        init_statuses = pod.status.init_container_statuses or []
-        container_statuses = pod.status.container_statuses or []
-
-        for status in init_statuses:
-            state = status.state
-
-            if state and state.waiting and state.waiting.reason:
-                return f"Init:{state.waiting.reason}"
-
-            if state and state.terminated and state.terminated.exit_code != 0:
-                reason = state.terminated.reason or "Error"
-                return f"Init:{reason}"
-
-        for status in container_statuses:
-            state = status.state
-
-            if state and state.waiting and state.waiting.reason:
-                return state.waiting.reason
-
-            if state and state.terminated and state.terminated.reason:
-                if pod.status.phase != "Succeeded":
-                    return state.terminated.reason
-
-        return pod.status.phase or "Unknown"
-
-    def _pod_age(self, pod):
-        created = pod.metadata.creation_timestamp
-
-        if not created:
-            return "unknown"
-
-        now = datetime.now(timezone.utc)
-
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=timezone.utc)
-
-        seconds = int((now - created).total_seconds())
-
-        if seconds < 0:
-            seconds = 0
-
-        if seconds < 60:
-            return f"{seconds}s"
-
-        minutes = seconds // 60
-
-        # Matches your requested style: 161m rather than 2h41m.
-        if minutes < 1440:
-            return f"{minutes}m"
-
-        days = minutes // 1440
-        return f"{days}d"
-
-    def _pod_file_content(self, pod):
         return (
-            f"Ready: {self._pod_ready(pod)}\n"
-            f"Status: {self._pod_status(pod)}\n"
-            f"Restarts: {self._pod_restarts(pod)}\n"
-            f"Age: {self._pod_age(pod)}\n"
-            f"IP: {self._pod_ip(pod)}\n"
-            f"Node: {self._pod_node(pod)}\n"
+            f"Ready: {ready}/{total}\n"
+            f"Status: {pod.status.phase or '<unknown>'}\n"
+            f"Restarts: {restarts}\n"
+            f"Age: {self._age(pod.metadata.creation_timestamp)}\n"
+            f"IP: {pod.status.pod_ip or '<none>'}\n"
+            f"Node: {pod.spec.node_name or '<none>'}\n"
         )
 
-    def _deployment_yaml_content(self, namespace, deployment):
-        deployment_obj = self._deployment(namespace, deployment)
+    def _service_status_text(self, namespace: str, service_name: str) -> str:
+        service = self._read_service(namespace, service_name)
+        spec = service.spec
+        status = service.status
 
-        if not deployment_obj:
-            return None
+        ports = []
+        for port in spec.ports or []:
+            port_bits = [str(port.port)]
+            if port.target_port:
+                port_bits.append(f"target={port.target_port}")
+            if port.node_port:
+                port_bits.append(f"node={port.node_port}")
+            protocol = port.protocol or "TCP"
+            ports.append(f"{'/'.join(port_bits)}/{protocol}")
 
-        deployment_dict = self.api_client.sanitize_for_serialization(
-            deployment_obj
+        selector = "<none>"
+        if spec.selector:
+            selector = ",".join(f"{key}={value}" for key, value in sorted(spec.selector.items()))
+
+        external_ips = list(spec.external_i_ps or [])
+        lb = status.load_balancer if status else None
+        if lb and lb.ingress:
+            for ingress in lb.ingress:
+                if ingress.ip:
+                    external_ips.append(ingress.ip)
+                elif ingress.hostname:
+                    external_ips.append(ingress.hostname)
+
+        return (
+            f"Name: {service.metadata.name}\n"
+            f"Type: {spec.type or '<unknown>'}\n"
+            f"Cluster IP: {spec.cluster_ip or '<none>'}\n"
+            f"External IP: {', '.join(external_ips) if external_ips else '<none>'}\n"
+            f"Ports: {', '.join(ports) if ports else '<none>'}\n"
+            f"Selector: {selector}\n"
+            f"Age: {self._age(service.metadata.creation_timestamp)}\n"
         )
 
-        return yaml.safe_dump(
-            deployment_dict,
-            default_flow_style=False,
-            sort_keys=False,
-        )
+    def _file_bytes(self, path: str) -> bytes:
+        parts = self._parts(path)
 
-    def getattr(self, path, fh=None):
-        # /
-        if path == "/":
-            return self._dir_attrs()
+        # /<namespace>/<deployment>/deployment.yaml
+        if len(parts) == 3 and parts[0] in self._namespaces():
+            namespace, deployment, filename = parts
+            if filename == "deployment.yaml" and deployment in self._deployments(namespace):
+                return self._serialise_yaml(self._read_deployment(namespace, deployment)).encode()
 
-        parts = path.strip("/").split("/")
+            if deployment in self._deployments(namespace):
+                return self._pod_status_text(namespace, filename).encode()
 
-        # /namespace or /node
-        if len(parts) == 1:
-            name = parts[0]
+        # /<namespace>/services/<service>/status
+        # /<namespace>/services/<service>/deployment.yaml
+        if (
+            len(parts) == 4
+            and parts[0] in self._namespaces()
+            and parts[1] == "services"
+            and parts[2] in self._services(parts[0])
+        ):
+            namespace, _, service_name, filename = parts
 
-            if name in self._namespaces():
-                return self._dir_attrs()
+            if filename == "status":
+                return self._service_status_text(namespace, service_name).encode()
 
-            if name in self._nodes():
-                return self._dir_attrs()
-
-            raise FuseOSError(errno.ENOENT)
-
-        # /namespace/deployment or /node/symlink
-        if len(parts) == 2:
-            first, second = parts
-
-            if first in self._namespaces():
-                namespace = first
-                deployment = second
-
-                if deployment in self._deployments(namespace):
-                    return self._dir_attrs()
-
-                raise FuseOSError(errno.ENOENT)
-
-            if first in self._nodes():
-                node_name = first
-                link_name = second
-                target = self._pod_links_for_node(node_name).get(link_name)
-
-                if target:
-                    return self._symlink_attrs(target)
-
-                raise FuseOSError(errno.ENOENT)
-
-            raise FuseOSError(errno.ENOENT)
-
-        # /namespace/deployment/deployment.yaml or /namespace/deployment/pod
-        if len(parts) == 3:
-            namespace, deployment, name = parts
-
-            if namespace not in self._namespaces():
-                raise FuseOSError(errno.ENOENT)
-
-            if deployment not in self._deployments(namespace):
-                raise FuseOSError(errno.ENOENT)
-
-            if name == "deployment.yaml":
-                content = self._deployment_yaml_content(namespace, deployment)
-
-                if content is None:
-                    raise FuseOSError(errno.ENOENT)
-
-                return self._file_attrs(content)
-
-            pod = self._pod_for_deployment(namespace, deployment, name)
-
-            if pod:
-                return self._file_attrs(self._pod_file_content(pod))
-
-            raise FuseOSError(errno.ENOENT)
+            if filename == "deployment.yaml":
+                # Filename requested by the user; content is the Kubernetes Service
+                # object definition.
+                return self._serialise_yaml(self._read_service(namespace, service_name)).encode()
 
         raise FuseOSError(errno.ENOENT)
 
-    def readdir(self, path, fh):
-        # ls /
-        if path == "/":
-            yield "."
-            yield ".."
+    # ---------------------------------------------------------------------
+    # Path helpers
+    # ---------------------------------------------------------------------
 
-            for namespace in self._namespaces():
-                yield namespace
+    def _parts(self, path: str) -> List[str]:
+        return [part for part in path.split("/") if part]
 
-            for node in self._nodes():
-                yield node
+    def _is_namespace_dir(self, parts: List[str]) -> bool:
+        return len(parts) == 1 and parts[0] in self._namespaces()
 
-            return
+    def _is_node_dir(self, parts: List[str]) -> bool:
+        return len(parts) == 1 and parts[0] in self._nodes()
 
-        parts = path.strip("/").split("/")
+    def _is_deployment_dir(self, parts: List[str]) -> bool:
+        return (
+            len(parts) == 2
+            and parts[0] in self._namespaces()
+            and parts[1] in self._deployments(parts[0])
+        )
 
-        # ls /namespace or ls /node
-        if len(parts) == 1:
-            name = parts[0]
+    def _is_services_dir(self, parts: List[str]) -> bool:
+        return len(parts) == 2 and parts[0] in self._namespaces() and parts[1] == "services"
 
-            if name in self._namespaces():
-                yield "."
-                yield ".."
+    def _is_service_dir(self, parts: List[str]) -> bool:
+        return (
+            len(parts) == 3
+            and parts[0] in self._namespaces()
+            and parts[1] == "services"
+            and parts[2] in self._services(parts[0])
+        )
 
-                for deployment in self._deployments(name):
-                    yield deployment
+    def _is_deployment_file(self, parts: List[str]) -> bool:
+        return (
+            len(parts) == 3
+            and parts[0] in self._namespaces()
+            and parts[1] in self._deployments(parts[0])
+            and parts[2] == "deployment.yaml"
+        )
 
-                return
+    def _is_pod_file(self, parts: List[str]) -> bool:
+        return (
+            len(parts) == 3
+            and parts[0] in self._namespaces()
+            and parts[1] in self._deployments(parts[0])
+            and parts[2] in self._pod_names_for_deployment(parts[0], parts[1])
+        )
 
-            if name in self._nodes():
-                yield "."
-                yield ".."
+    def _is_service_file(self, parts: List[str]) -> bool:
+        return (
+            len(parts) == 4
+            and parts[0] in self._namespaces()
+            and parts[1] == "services"
+            and parts[2] in self._services(parts[0])
+            and parts[3] in {"status", "deployment.yaml"}
+        )
 
-                for link_name in sorted(self._pod_links_for_node(name).keys()):
-                    yield link_name
+    def _is_node_pod_symlink(self, parts: List[str]) -> bool:
+        return len(parts) == 2 and parts[0] in self._nodes() and parts[1] in self._pods_on_node(parts[0])
 
-                return
+    # ---------------------------------------------------------------------
+    # FUSE operations
+    # ---------------------------------------------------------------------
 
-            raise FuseOSError(errno.ENOENT)
+    def getattr(self, path: str, fh=None):
+        now = time.time()
+        parts = self._parts(path)
 
-        # ls /namespace/deployment
-        if len(parts) == 2:
-            namespace, deployment = parts
+        try:
+            if path == "/" or self._is_namespace_dir(parts) or self._is_node_dir(parts):
+                return {
+                    "st_mode": DIR_MODE,
+                    "st_nlink": 2,
+                    "st_ctime": now,
+                    "st_mtime": now,
+                    "st_atime": now,
+                }
 
-            if namespace not in self._namespaces():
+            if self._is_deployment_dir(parts) or self._is_services_dir(parts) or self._is_service_dir(parts):
+                return {
+                    "st_mode": DIR_MODE,
+                    "st_nlink": 2,
+                    "st_ctime": now,
+                    "st_mtime": now,
+                    "st_atime": now,
+                }
+
+            if self._is_node_pod_symlink(parts):
+                return {
+                    "st_mode": SYMLINK_MODE,
+                    "st_nlink": 1,
+                    "st_size": len(self._pods_on_node(parts[0])[parts[1]]),
+                    "st_ctime": now,
+                    "st_mtime": now,
+                    "st_atime": now,
+                }
+
+            if self._is_deployment_file(parts) or self._is_pod_file(parts) or self._is_service_file(parts):
+                return {
+                    "st_mode": FILE_MODE,
+                    "st_nlink": 1,
+                    "st_size": len(self._file_bytes(path)),
+                    "st_ctime": now,
+                    "st_mtime": now,
+                    "st_atime": now,
+                }
+
+        except ApiException as exc:
+            if exc.status == 404:
                 raise FuseOSError(errno.ENOENT)
+            raise
 
-            if deployment not in self._deployments(namespace):
+        raise FuseOSError(errno.ENOENT)
+
+    def readdir(self, path: str, fh):
+        parts = self._parts(path)
+
+        try:
+            if path == "/":
+                return [".", "..", *self._namespaces(), *self._nodes()]
+
+            if self._is_namespace_dir(parts):
+                namespace = parts[0]
+                return [".", "..", "services", *self._deployments(namespace)]
+
+            if self._is_deployment_dir(parts):
+                namespace, deployment = parts
+                return [
+                    ".",
+                    "..",
+                    "deployment.yaml",
+                    *self._pod_names_for_deployment(namespace, deployment),
+                ]
+
+            if self._is_services_dir(parts):
+                namespace = parts[0]
+                return [".", "..", *self._services(namespace)]
+
+            if self._is_service_dir(parts):
+                return [".", "..", "status", "deployment.yaml"]
+
+            if self._is_node_dir(parts):
+                return [".", "..", *self._pods_on_node(parts[0]).keys()]
+
+        except ApiException as exc:
+            if exc.status == 404:
                 raise FuseOSError(errno.ENOENT)
+            raise
 
-            yield "."
-            yield ".."
-            yield "deployment.yaml"
+        raise FuseOSError(errno.ENOENT)
 
-            for pod in self._pods_for_deployment(namespace, deployment):
-                yield pod
+    def read(self, path: str, size: int, offset: int, fh):
+        data = self._file_bytes(path)
+        return data[offset : offset + size]
 
-            return
+    def readlink(self, path: str):
+        parts = self._parts(path)
+        if self._is_node_pod_symlink(parts):
+            return self._pods_on_node(parts[0])[parts[1]]
+        raise FuseOSError(errno.ENOENT)
 
-        raise FuseOSError(errno.ENOTDIR)
+    def unlink(self, path: str):
+        parts = self._parts(path)
 
-    def readlink(self, path):
-        parts = path.strip("/").split("/")
+        if not self._is_pod_file(parts):
+            raise FuseOSError(errno.EPERM)
 
-        # /node/link
-        if len(parts) != 2:
-            raise FuseOSError(errno.EINVAL)
-
-        node_name, link_name = parts
-
-        if node_name not in self._nodes():
-            raise FuseOSError(errno.ENOENT)
-
-        target = self._pod_links_for_node(node_name).get(link_name)
-
-        if not target:
-            raise FuseOSError(errno.ENOENT)
-
-        return target
-
-    def open(self, path, flags):
-        parts = path.strip("/").split("/")
-
-        if len(parts) != 3:
-            raise FuseOSError(errno.EISDIR)
-
-        namespace, deployment, name = parts
-
-        if namespace not in self._namespaces():
-            raise FuseOSError(errno.ENOENT)
-
-        if deployment not in self._deployments(namespace):
-            raise FuseOSError(errno.ENOENT)
-
-        if name == "deployment.yaml":
-            if self._deployment_yaml_content(namespace, deployment) is None:
-                raise FuseOSError(errno.ENOENT)
-
-            return 0
-
-        pod = self._pod_for_deployment(namespace, deployment, name)
-
-        if not pod:
-            raise FuseOSError(errno.ENOENT)
-
+        namespace, _, pod_name = parts
+        self.core.delete_namespaced_pod(pod_name, namespace)
         return 0
 
-    def read(self, path, size, offset, fh):
-        parts = path.strip("/").split("/")
 
-        if len(parts) != 3:
-            raise FuseOSError(errno.EISDIR)
+def main() -> None:
+    import argparse
 
-        namespace, deployment, name = parts
+    parser = argparse.ArgumentParser(description="Expose a Kubernetes cluster as a FUSE filesystem")
+    parser.add_argument("mountpoint")
+    parser.add_argument("-f", "--foreground", action="store_true", help="run in the foreground")
+    args = parser.parse_args()
 
-        if namespace not in self._namespaces():
-            raise FuseOSError(errno.ENOENT)
-
-        if deployment not in self._deployments(namespace):
-            raise FuseOSError(errno.ENOENT)
-
-        if name == "deployment.yaml":
-            content = self._deployment_yaml_content(namespace, deployment)
-
-            if content is None:
-                raise FuseOSError(errno.ENOENT)
-
-            data = content.encode("utf-8")
-            return data[offset:offset + size]
-
-        pod = self._pod_for_deployment(namespace, deployment, name)
-
-        if not pod:
-            raise FuseOSError(errno.ENOENT)
-
-        data = self._pod_file_content(pod).encode("utf-8")
-
-        return data[offset:offset + size]
+    FUSE(
+        K8sFS(),
+        args.mountpoint,
+        foreground=args.foreground,
+        nothreads=True,
+        allow_other=False,
+    )
 
 
 if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <mountpoint>")
-        sys.exit(1)
-
-    mountpoint = sys.argv[1]
-
-    FUSE(
-        K8sNamespaceFS(),
-        mountpoint,
-        foreground=True,
-        nothreads=True,
-    )
+    main()
