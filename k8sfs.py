@@ -19,7 +19,7 @@ SYMLINK_MODE = stat.S_IFLNK | 0o777
 
 class K8sFS(LoggingMixIn, Operations):
     """
-    Exposes Kubernetes namespaces, deployments, pods, services, and nodes as a
+    Exposes Kubernetes namespaces, deployments, pods, services, ingresses, and nodes as a
     read-only filesystem, except that deleting a pod status file deletes the pod.
 
     Layout:
@@ -28,6 +28,10 @@ class K8sFS(LoggingMixIn, Operations):
         <namespace>/
           services/
             <service>/
+              status
+              deployment.yaml
+          ingresses/
+            <ingress>/
               status
               deployment.yaml
           <deployment>/
@@ -45,6 +49,7 @@ class K8sFS(LoggingMixIn, Operations):
 
         self.core = client.CoreV1Api()
         self.apps = client.AppsV1Api()
+        self.networking = client.NetworkingV1Api()
         self.api_client = client.ApiClient()
 
     # ---------------------------------------------------------------------
@@ -93,11 +98,20 @@ class K8sFS(LoggingMixIn, Operations):
             for service in self.core.list_namespaced_service(namespace).items
         )
 
+    def _ingresses(self, namespace: str) -> List[str]:
+        return sorted(
+            ingress.metadata.name
+            for ingress in self.networking.list_namespaced_ingress(namespace).items
+        )
+
     def _read_deployment(self, namespace: str, deployment: str):
         return self.apps.read_namespaced_deployment(deployment, namespace)
 
     def _read_service(self, namespace: str, service: str):
         return self.core.read_namespaced_service(service, namespace)
+
+    def _read_ingress(self, namespace: str, ingress: str):
+        return self.networking.read_namespaced_ingress(ingress, namespace)
 
     def _deployment_selector(self, namespace: str, deployment: str) -> str:
         deploy = self._read_deployment(namespace, deployment)
@@ -215,6 +229,54 @@ class K8sFS(LoggingMixIn, Operations):
             f"Age: {self._age(service.metadata.creation_timestamp)}\n"
         )
 
+    def _ingress_status_text(self, namespace: str, ingress_name: str) -> str:
+        ingress = self._read_ingress(namespace, ingress_name)
+        spec = ingress.spec
+        status = ingress.status
+
+        # Extract hosts from rules
+        hosts = []
+        if spec.rules:
+            for rule in spec.rules:
+                if rule.host:
+                    hosts.append(rule.host)
+
+        # Extract IPs and hostnames from status
+        addresses = []
+        lb = status.load_balancer if status else None
+        if lb and lb.ingress:
+            for ingress_status in lb.ingress:
+                if ingress_status.ip:
+                    addresses.append(ingress_status.ip)
+                elif ingress_status.hostname:
+                    addresses.append(ingress_status.hostname)
+
+        # Extract TLS hosts
+        tls_hosts = []
+        if spec.tls:
+            for tls in spec.tls:
+                if tls.hosts:
+                    tls_hosts.extend(tls.hosts)
+
+        # Extract backend services
+        backend_services = []
+        if spec.rules:
+            for rule in spec.rules:
+                if rule.http and rule.http.paths:
+                    for path in rule.http.paths:
+                        if path.backend and path.backend.service:
+                            service = path.backend.service
+                            backend_services.append(f"{service.name}:{service.port.number if service.port else 'N/A'}")
+
+        return (
+            f"Name: {ingress.metadata.name}\n"
+            f"Hosts: {', '.join(hosts) if hosts else '<none>'}\n"
+            f"Address: {', '.join(addresses) if addresses else '<pending>'}\n"
+            f"TLS: {', '.join(tls_hosts) if tls_hosts else '<none>'}\n"
+            f"Backend Services: {', '.join(backend_services) if backend_services else '<none>'}\n"
+            f"Age: {self._age(ingress.metadata.creation_timestamp)}\n"
+        )
+
     def _file_bytes(self, path: str) -> bytes:
         parts = self._parts(path)
 
@@ -244,6 +306,24 @@ class K8sFS(LoggingMixIn, Operations):
                 # Filename requested by the user; content is the Kubernetes Service
                 # object definition.
                 return self._serialise_yaml(self._read_service(namespace, service_name)).encode()
+
+        # /<namespace>/ingresses/<ingress>/status
+        # /<namespace>/ingresses/<ingress>/deployment.yaml
+        if (
+            len(parts) == 4
+            and parts[0] in self._namespaces()
+            and parts[1] == "ingresses"
+            and parts[2] in self._ingresses(parts[0])
+        ):
+            namespace, _, ingress_name, filename = parts
+
+            if filename == "status":
+                return self._ingress_status_text(namespace, ingress_name).encode()
+
+            if filename == "deployment.yaml":
+                # Filename requested by the user; content is the Kubernetes Ingress
+                # object definition.
+                return self._serialise_yaml(self._read_ingress(namespace, ingress_name)).encode()
 
         raise FuseOSError(errno.ENOENT)
 
@@ -278,6 +358,17 @@ class K8sFS(LoggingMixIn, Operations):
             and parts[2] in self._services(parts[0])
         )
 
+    def _is_ingresses_dir(self, parts: List[str]) -> bool:
+        return len(parts) == 2 and parts[0] in self._namespaces() and parts[1] == "ingresses"
+
+    def _is_ingress_dir(self, parts: List[str]) -> bool:
+        return (
+            len(parts) == 3
+            and parts[0] in self._namespaces()
+            and parts[1] == "ingresses"
+            and parts[2] in self._ingresses(parts[0])
+        )
+
     def _is_deployment_file(self, parts: List[str]) -> bool:
         return (
             len(parts) == 3
@@ -303,6 +394,15 @@ class K8sFS(LoggingMixIn, Operations):
             and parts[3] in {"status", "deployment.yaml"}
         )
 
+    def _is_ingress_file(self, parts: List[str]) -> bool:
+        return (
+            len(parts) == 4
+            and parts[0] in self._namespaces()
+            and parts[1] == "ingresses"
+            and parts[2] in self._ingresses(parts[0])
+            and parts[3] in {"status", "deployment.yaml"}
+        )
+
     def _is_node_pod_symlink(self, parts: List[str]) -> bool:
         return len(parts) == 2 and parts[0] in self._nodes() and parts[1] in self._pods_on_node(parts[0])
 
@@ -324,7 +424,13 @@ class K8sFS(LoggingMixIn, Operations):
                     "st_atime": now,
                 }
 
-            if self._is_deployment_dir(parts) or self._is_services_dir(parts) or self._is_service_dir(parts):
+            if (
+                self._is_deployment_dir(parts)
+                or self._is_services_dir(parts)
+                or self._is_service_dir(parts)
+                or self._is_ingresses_dir(parts)
+                or self._is_ingress_dir(parts)
+            ):
                 return {
                     "st_mode": DIR_MODE,
                     "st_nlink": 2,
@@ -343,7 +449,12 @@ class K8sFS(LoggingMixIn, Operations):
                     "st_atime": now,
                 }
 
-            if self._is_deployment_file(parts) or self._is_pod_file(parts) or self._is_service_file(parts):
+            if (
+                self._is_deployment_file(parts)
+                or self._is_pod_file(parts)
+                or self._is_service_file(parts)
+                or self._is_ingress_file(parts)
+            ):
                 return {
                     "st_mode": FILE_MODE,
                     "st_nlink": 1,
@@ -369,7 +480,7 @@ class K8sFS(LoggingMixIn, Operations):
 
             if self._is_namespace_dir(parts):
                 namespace = parts[0]
-                return [".", "..", "services", *self._deployments(namespace)]
+                return [".", "..", "services", "ingresses", *self._deployments(namespace)]
 
             if self._is_deployment_dir(parts):
                 namespace, deployment = parts
@@ -385,6 +496,13 @@ class K8sFS(LoggingMixIn, Operations):
                 return [".", "..", *self._services(namespace)]
 
             if self._is_service_dir(parts):
+                return [".", "..", "status", "deployment.yaml"]
+
+            if self._is_ingresses_dir(parts):
+                namespace = parts[0]
+                return [".", "..", *self._ingresses(namespace)]
+
+            if self._is_ingress_dir(parts):
                 return [".", "..", "status", "deployment.yaml"]
 
             if self._is_node_dir(parts):
