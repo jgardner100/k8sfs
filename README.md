@@ -6,6 +6,62 @@ It lets you browse Kubernetes namespaces, Deployments, Pods, and Nodes with norm
 
 The filesystem is intended as an experimental/admin convenience tool, not a replacement for `kubectl`.
 
+## How the filesystem works
+
+k8sfs uses FUSE (Filesystem in Userspace) to create a virtual filesystem that mirrors Kubernetes cluster resources as a hierarchical directory structure. Here's what happens under the hood:
+
+### Architecture
+
+- **FUSE Integration**: k8sfs implements the FUSE protocol using the `fusepy` library, allowing it to intercept filesystem operations like `ls`, `cat`, `mkdir`, and `rm` and translate them into Kubernetes API calls.
+- **Kubernetes API Client**: The `kubernetes` Python client communicates with your Kubernetes cluster to fetch and manipulate resources.
+- **Dynamic Generation**: The filesystem is dynamically generated from live cluster data rather than being stored on disk. When you list a directory or read a file, k8sfs queries the Kubernetes API and generates the content in real-time.
+- **Caching**: To improve performance and reduce API traffic, k8sfs caches cluster data for 5 seconds. After this period, the cache expires and fresh data is fetched from the cluster.
+
+### Filesystem operations
+
+**Reading directories (ls)**
+- When you run `ls` on a directory, k8sfs calls the Kubernetes API to list the relevant resources (namespaces, Deployments, Pods, or Nodes).
+- The results are converted into directory entries that the filesystem presents to your shell.
+
+**Reading files (cat)**
+- When you read a file like `deployment.yaml` or a Pod status file, k8sfs fetches the resource from the Kubernetes API and formats it as text.
+- Deployment files are serialized from the live Kubernetes API object as YAML.
+- Pod files are generated from Pod status information and formatted as a readable summary.
+
+**Deleting files (rm)**
+- When you delete a Pod file, k8sfs translates this into a Kubernetes API call to delete the Pod.
+- Only Pod files can be deleted; other files are read-only and protected from deletion.
+
+**Following symlinks (readlink)**
+- Node directories contain symlinks to Pod files on other paths.
+- When you follow a symlink like `readlink node1/nginx-pod`, k8sfs resolves the link path without fetching additional data.
+
+### Data flow
+
+1. **User command**: You run `ls ~/mnt/k8s/default`
+2. **FUSE intercept**: FUSE intercepts the system call and routes it to k8sfs
+3. **API query**: k8sfs queries the Kubernetes API for namespaces or resources
+4. **Caching check**: If data is cached and fresh (< 5 seconds old), use the cache; otherwise fetch new data
+5. **Data transformation**: API responses are transformed into filesystem metadata (inode, mode, size, etc.)
+6. **Return to shell**: The results are presented as normal directory entries
+
+### Resource mapping
+
+The filesystem structure directly reflects Kubernetes resource hierarchy:
+
+- **Root level**: Namespaces and Nodes
+- **Namespace level**: Deployments
+- **Deployment level**: `deployment.yaml` and Pod status files
+- **Node level**: Symlinks to Pods running on that node
+
+This mapping allows you to navigate the cluster using familiar filesystem commands.
+
+### Live updates
+
+- The filesystem reflects the current state of your cluster because it queries the live Kubernetes API.
+- Changes made in the cluster (e.g., a Pod is deleted by another process) become visible in the filesystem after the cache expires.
+- Changes made through the filesystem (e.g., deleting a Pod file) immediately trigger Kubernetes API calls, so they take effect immediately.
+
 ## What it exposes
 
 After mounting, the root directory contains:
